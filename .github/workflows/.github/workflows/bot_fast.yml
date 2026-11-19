@@ -1,0 +1,39 @@
+name: signal-bot-fast
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "once / test / backtest"
+        default: "test"
+permissions:
+  contents: write
+concurrency:
+  group: fast-bot
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run fast bot
+        run: python signal_bot_fast.py ${{ github.event.inputs.mode || 'once' }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Save state
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add fast_state.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "fast state"
+            git pull --rebase origin main
+            git push
+          fi
