@@ -1,3 +1,5 @@
+
+  
 """
 BTC & GOLD Multi-Timeframe Signal Bot (Daily + 1H + 15m)
 Free data: yfinance | Alerts: Telegram
@@ -148,42 +150,107 @@ def run_backtest():
 STATE_FILE = "last_sent.json"
 
 
-def make_msg(name, row, wr):
+def load_state():
+    try:
+        st = json.load(open(STATE_FILE))
+    except Exception:
+        st = {}
+    if "open" not in st:   # purana format -> naya format
+        st = {"last": {k: v for k, v in st.items() if isinstance(v, str)}, "open": {}}
+    st.setdefault("last", {})
+    st.setdefault("tally", {"W": 0, "L": 0, "T": 0, "R": 0.0})
+    return st
+
+
+def new_trade(row, ts):
     d = int(row.sig)
-    e, risk = row.close, row.atr * ATR_MULT
-    sl, tp = e - d * risk, e + d * risk * RR
+    e, risk = float(row.close), float(row.atr * ATR_MULT)
+    return {"dir": d, "entry": e, "risk": risk, "sl": e - d * risk,
+            "tp": e + d * risk * RR, "ts": str(ts)}
+
+
+def make_msg(name, t, row, wr):
+    d = t["dir"]
     return (f"{'🟢 BUY' if d == 1 else '🔴 SELL'} {name}\n"
-            f"Entry: {e:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f} (RR 1:{RR})\n"
+            f"Entry: {t['entry']:.2f}\nSL: {t['sl']:.2f}\nTP: {t['tp']:.2f} (RR 1:{RR})\n"
             f"Confluence score: {int(row.score)}/100\n"
             f"Backtest win-rate: {wr['win_rate']}% ({wr['trades']} trades)\n"
             f"TF: Daily + 1H + 15m aligned\n"
-            f"Time: {dt.datetime.utcnow():%d-%b %H:%M} UTC")
+            f"Time: {dt.datetime.utcnow():%d-%b %H:%M} UTC\n"
+            f"(Is trade ka TP/SL result alag message me aayega)")
+
+
+def check_open(name, m, st):
+    """Open trade ka TP/SL/time-exit check. Close hua to message bhejta hai."""
+    t = st["open"].get(name)
+    if not t:
+        return False
+    d, e, sl, tp, risk = t["dir"], t["entry"], t["sl"], t["tp"], t["risk"]
+    after = m[m.index > pd.Timestamp(t["ts"])]
+    result = None
+    for k, (ts, row) in enumerate(after.iterrows()):
+        hit_sl = row.low <= sl if d == 1 else row.high >= sl
+        hit_tp = row.high >= tp if d == 1 else row.low <= tp
+        if hit_sl:                       # dono ek candle me lage to SL maano (conservative)
+            result = ("SL", -1.0, ts)
+            break
+        if hit_tp:
+            result = ("TP", RR, ts)
+            break
+        if k + 1 >= MAX_BARS:
+            result = ("TIME", float((row.close - e) * d / risk), ts)
+            break
+    if not result:
+        return False
+    kind, r, ts = result
+    tl = st["tally"]
+    tl["R"] = round(tl["R"] + r, 2)
+    if kind == "TP":
+        tl["W"] += 1
+        head = "✅ TP HIT"
+    elif kind == "SL":
+        tl["L"] += 1
+        head = "❌ SL HIT"
+    else:
+        tl["T"] += 1
+        head = "⏱ TIME EXIT (1 din ho gaya)"
+    send(f"{head} - {name} {'BUY' if d == 1 else 'SELL'}\n"
+         f"Entry: {e:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\n"
+         f"Result: {r:+.2f}R\n"
+         f"Record (bot ke signals): {tl['W']}W / {tl['L']}L / {tl['T']} time-exit | Total {tl['R']:+.2f}R")
+    del st["open"][name]
+    st["last"][name] = str(ts)           # isse purane signals dobara nahi aayenge
+    return True
 
 
 def run_once():
-    """Ek baar check karke exit (GitHub Actions ke liye). Duplicate alert state file se rokta hai."""
-    try:
-        state = json.load(open(STATE_FILE))
-    except Exception:
-        state = {}
+    """Ek baar check karke exit (GitHub Actions). State file me open trades yaad rehte hain."""
+    st = load_state()
     changed = False
     for name, sym in SYMBOLS.items():
         try:
             m = build(sym)
             wr = stats(backtest(m))
-            for k in (-3, -2):   # last 2 closed candles (cron delay ke liye)
+            if check_open(name, m, st):
+                changed = True
+                continue
+            if name in st["open"]:       # trade abhi khula hai -> naya signal nahi
+                continue
+            for k in (-3, -2):           # last 2 closed candles (cron delay ke liye)
                 row, ts = m.iloc[k], m.index[k]
                 age = (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 60
-                if row.sig != 0 and 15 <= age <= 45 and state.get(name) != str(ts):
-                    msg = make_msg(name, row, wr)
-                    send(msg)
-                    print(msg)
-                    state[name] = str(ts)
+                last = st["last"].get(name)
+                fresh = last is None or ts > pd.Timestamp(last)
+                if row.sig != 0 and 15 <= age <= 45 and fresh and name not in st["open"]:
+                    t = new_trade(row, ts)
+                    send(make_msg(name, t, row, wr))
+                    st["open"][name] = t
+                    st["last"][name] = str(ts)
                     changed = True
         except Exception as ex:
             print(name, "error:", ex)
     if changed:
-        json.dump(state, open(STATE_FILE, "w"))
+        json.dump(st, open(STATE_FILE, "w"))
     print("check done", dt.datetime.utcnow())
 
 
@@ -198,7 +265,7 @@ def run_live():
                 row, ts = m.iloc[-2], m.index[-2]
                 age = (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 60
                 if row.sig != 0 and 15 <= age <= 45 and last_sent.get(name) != ts:
-                    send(make_msg(name, row, win[name]))
+                    send(make_msg(name, new_trade(row, ts), row, win[name]))
                     last_sent[name] = ts
             except Exception as ex:
                 print(name, "error:", ex)
@@ -216,4 +283,4 @@ if __name__ == "__main__":
         print("test sent")
     else:
         run_live()
-  
+    
