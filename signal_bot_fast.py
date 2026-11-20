@@ -452,4 +452,68 @@ INDIA = ("RELIANCE TCS HDFCBANK INFY ICICIBANK HINDUNILVR ITC SBIN BHARTIARTL KO
          "DABUR GODREJCP HAVELLS SIEMENS AMBUJACEM BANKBARODA PNB DLF VEDL IOC GAIL TVSMOTOR MUTHOOTFIN "
          "CHOLAFIN TRENT HAL BEL JINDALSTEL LUPIN AUROPHARMA COLPAL MARICO BERGEPAINT PAGEIND UPL BOSCHLTD "
          "MRF ABB POLYCAB INDIGO IRCTC").split() + ["M&M", "BAJAJ-AUTO"]
-INDIA_COST = 0.0026     # round-trip: STT 0.2% + stamp 0.015% + baaki ~0.25% (
+INDIA_COST = 0.0026     # round-trip: STT 0.2% + stamp 0.015% + baaki ~0.25% (brokerage 0 maan kar)
+
+
+def run_india():
+    import time
+    nifty = get("^NSEI", "1d", "max")
+    nifty = nifty[nifty.index >= "2010-01-01"]
+    reg = (nifty.close > ema(nifty.close, 200))
+    years = (nifty.index[-1] - nifty.index[0]).days / 365.25
+    split = nifty.index[int(len(nifty) * 0.7)]
+    allt, ok, fail = [], 0, []
+    for t in INDIA:
+        try:
+            df = get(t + ".NS", "1d", "max")
+            df = df[df.index >= "2010-01-01"]
+            if len(df) < 400:
+                fail.append(t)
+                continue
+            for r, en, ex in donchian(df, TREND_N, TREND_M, "long", INDIA_COST):
+                allt.append((r, en, ex, t))
+            ok += 1
+        except Exception as e:
+            fail.append(t)
+        time.sleep(0.3)
+    print(f"Stocks chale: {ok} | fail/kam data: {len(fail)} {fail[:10]}")
+    for label, use_reg in (("Nifty filter OFF", False), ("Nifty>EMA200 filter ON", True)):
+        tr = allt
+        if use_reg:
+            tr = [x for x in allt if bool(reg.asof(x[1] - pd.Timedelta(days=1)))]
+        if not tr:
+            continue
+        r = np.array([x[0] for x in tr])
+        wins, losses = r[r > 0].sum(), -r[r <= 0].sum()
+        oos = np.array([x[0] for x in tr if x[1] >= split])
+        ev = pd.Series(0, index=pd.date_range(nifty.index[0].normalize(), nifty.index[-1].normalize(), freq="D"))
+        for x in tr:
+            ev[x[1].normalize()] += 1
+            ev[x[2].normalize()] -= 1
+        openp = ev.cumsum()
+        print(f"\n{label}: trades={len(r)} ({len(r)/years:.0f}/saal, har stock ~{len(r)/years/max(ok,1):.1f}/saal) "
+              f"win={(r>0).mean()*100:.0f}% avgR={r.mean():+.2f} PF={wins/max(losses,1e-9):.2f} "
+              f"| OOS n={len(oos)} avgR={oos.mean() if len(oos) else 0:+.2f} "
+              f"| ek saath khule trade: avg={openp.mean():.0f} max={openp.max():.0f}")
+        yr = {}
+        for x in tr:
+            yr.setdefault(x[1].year, []).append(x[0])
+        print("  saal-wise (n, avgR):", " ".join(f"{y}:{len(v)},{np.mean(v):+.1f}" for y, v in sorted(yr.items())))
+    print("\nNote: sirf aaj ke listed stocks hain (delisted/fail hue stocks nahi), isliye result thoda zyada achha dikh sakta hai.")
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "once"
+    if mode == "test":
+        send("⚡5M bot Telegram se connect ho gaya.")
+        print("test sent")
+    elif mode == "backtest":
+        run_backtest()
+    elif mode == "research":
+        run_research()
+    elif mode == "trend":
+        run_trend()
+    elif mode == "india":
+        run_india()
+    else:
+        run_once()
