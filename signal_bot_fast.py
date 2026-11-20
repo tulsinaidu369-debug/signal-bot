@@ -259,6 +259,102 @@ def run_backtest():
     print("\nNote: 5m data ~60 din ka hai. Cost (spread/fees) minus hai. Past result future ki guarantee nahi.")
 
 
+# ====================== RESEARCH: kam trade, bade timeframe ======================
+def donchian(df, N, M, side, cost, atr_mult=2.0, filt=200):
+    """Breakout (pichhle N candle ka high/low todna) + EMA200 filter.
+    SL = 2xATR, exit = pichhle M candle ka low/high (trailing). Entry agli candle ke open par.
+    Return: [(R cost ke baad, entry_time)]"""
+    o, h, l, c = df.open.values, df.high.values, df.low.values, df.close.values
+    a = atr(df).values
+    e200 = ema(df.close, filt).values
+    n, res, i = len(df), [], max(N, M, filt) + 1
+    while i < n - 2:
+        if np.isnan(a[i]):
+            i += 1
+            continue
+        d = 0
+        if c[i] > h[i - N:i].max() and c[i] > e200[i]:
+            d = 1
+        elif side == "both" and c[i] < l[i - N:i].min() and c[i] < e200[i]:
+            d = -1
+        if d == 0:
+            i += 1
+            continue
+        e = o[i + 1]
+        risk = a[i] * atr_mult
+        stop0 = e - d * risk
+        j, exit_p = i + 1, None
+        while j < n:
+            if d == 1:
+                stop = max(stop0, l[j - M:j].min())
+                if o[j] <= stop:
+                    exit_p = o[j]
+                    break
+                if l[j] <= stop:
+                    exit_p = stop
+                    break
+            else:
+                stop = min(stop0, h[j - M:j].max())
+                if o[j] >= stop:
+                    exit_p = o[j]
+                    break
+                if h[j] >= stop:
+                    exit_p = stop
+                    break
+            j += 1
+        if exit_p is None:
+            exit_p, j = c[n - 1], n - 1
+        res.append(((exit_p - e) * d / risk - cost * e / risk, df.index[i + 1]))
+        i = j + 1
+    return res
+
+
+def rstats(trades, years, split):
+    if not trades:
+        return None
+    r = np.array([x[0] for x in trades])
+    eq = np.cumsum(r)
+    dd = float(np.max(np.maximum.accumulate(eq) - eq))
+    wins, losses = r[r > 0].sum(), -r[r <= 0].sum()
+    oos = np.array([x[0] for x in trades if x[1] >= split])
+    return dict(n=len(r), per_year=round(len(r) / years, 1), win=round((r > 0).mean() * 100),
+                avg=round(float(r.mean()), 2), pf=round(float(wins / losses), 2) if losses > 0 else 9.99,
+                sum=round(float(r.sum()), 1), dd=round(dd, 1),
+                n_oos=len(oos), avg_oos=round(float(oos.mean()), 2) if len(oos) else 0.0)
+
+
+def run_research():
+    rows = []
+    for name, sym in SYMBOLS.items():
+        frames = {"1d": get(sym, "1d", "max")}
+        h1 = get(sym, "1h", "730d")
+        frames["4h"] = h1.resample("4h").agg({"open": "first", "high": "max", "low": "min",
+                                               "close": "last", "volume": "sum"}).dropna()
+        for tf, df in frames.items():
+            years = max((df.index[-1] - df.index[0]).days / 365.25, 0.1)
+            split = df.index[int(len(df) * 0.7)]
+            for N in (20, 55):
+                for M in (10, 20):
+                    for side in ("long", "both"):
+                        st = rstats(donchian(df, N, M, side, COST[name]), years, split)
+                        if not st:
+                            continue
+                        st.update(sym=name, tf=tf, N=N, M=M, side=side, yrs=round(years, 1))
+                        rows.append(st)
+                        print(f"{name} {tf} N{N} M{M} {side}: n={st['n']} ({st['per_year']}/yr) win={st['win']}% "
+                              f"avgR={st['avg']:+} PF={st['pf']} sumR={st['sum']:+} DD={st['dd']}R "
+                              f"| OOS n={st['n_oos']} avgR={st['avg_oos']:+}")
+    print("\n===== TOP (min 20 trades, avgR>0 aur OOS avgR>0, cost ke baad) =====")
+    good = [r for r in rows if r["n"] >= 20 and r["avg"] > 0 and r["avg_oos"] > 0]
+    good.sort(key=lambda r: r["avg"], reverse=True)
+    for r in good[:8]:
+        print(f"{r['sym']} {r['tf']} N{r['N']} M{r['M']} {r['side']}: n={r['n']} ({r['per_year']}/yr) "
+              f"win={r['win']}% avgR={r['avg']:+} PF={r['pf']} DD={r['dd']}R OOS avgR={r['avg_oos']:+}")
+    if not good:
+        print("Koi combination dono shart (avgR>0 aur OOS>0) par khara nahi utra.")
+    print("\nNote: past result future ki guarantee nahi. OOS = last 30% data jo pehle nahi dekha.")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "once"
     if mode == "test":
@@ -266,6 +362,8 @@ if __name__ == "__main__":
         print("test sent")
     elif mode == "backtest":
         run_backtest()
+    elif mode == "research":
+        run_research()
     else:
         run_once()
-      
+          
