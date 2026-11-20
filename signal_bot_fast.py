@@ -259,11 +259,100 @@ def run_backtest():
     print("\nNote: 5m data ~60 din ka hai. Cost (spread/fees) minus hai. Past result future ki guarantee nahi.")
 
 
+# ====================== TREND BOT (Daily, kam trade) ======================
+TREND_N, TREND_M, TREND_ATR = 55, 20, 2.0     # research me sabse achha/stable: N55 M20, long-only
+TREND_BT = {"BTC": "win 58% | avgR +5.0 | PF 15 | ~3 trade/saal (daily 2014-26)",
+            "GOLD": "win 43% | avgR +0.8 | PF 2.4 | ~3 trade/saal (daily 2005-26)"}
+
+
+def trend_frame(sym):
+    d = get(sym, "1d", "max")
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    if d.index[-1] >= today:          # aaj ki candle abhi ban rahi hai -> hata do
+        d = d.iloc[:-1]
+    return d
+
+
+def run_trend():
+    st = load_state()
+    tr = st.setdefault("trend", {"pos": {}, "last_sig": {}, "tally": {"W": 0, "L": 0, "R": 0.0}})
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    changed = False
+    for name, sym in SYMBOLS.items():
+        try:
+            d = trend_frame(sym)
+            o, h, l, c = d.open.values, d.high.values, d.low.values, d.close.values
+            a = atr(d).values
+            e200 = ema(d.close, 200).values
+            n = len(d)
+            i = n - 1
+            pos = tr["pos"].get(name)
+            if pos:                                   # khula trade: SL trail / exit check
+                sig_ts = pd.Timestamp(pos["ts"])
+                entry, risk, stop0 = pos["entry"], pos["risk"], pos["stop0"]
+                exited, jx = None, None
+                for j in range(n):
+                    if d.index[j] <= sig_ts:
+                        continue
+                    stop = max(stop0, l[j - TREND_M:j].min())
+                    if o[j] <= stop:
+                        exited, jx = o[j], j
+                        break
+                    if l[j] <= stop:
+                        exited, jx = stop, j
+                        break
+                if exited is not None:
+                    r = (exited - entry) / risk
+                    tl = tr["tally"]
+                    tl["R"] = round(tl["R"] + r, 2)
+                    tl["W" if r > 0 else "L"] += 1
+                    send(f"{'✅' if r > 0 else '❌'} TREND EXIT - {name} (Daily)\n"
+                         f"Stop lag gaya: ~{exited:.2f}\nEntry (ref): {entry:.2f}\n"
+                         f"Result: {r:+.2f}R\n"
+                         f"TREND record: {tl['W']}W / {tl['L']}L | Total {tl['R']:+.2f}R")
+                    del tr["pos"][name]
+                    tr["last_sig"][name] = str(d.index[jx])
+                    changed = True
+                else:
+                    cur = max(stop0, l[n - TREND_M:n].min())   # agli candle ke liye SL
+                    if cur > pos["sl"] + 1e-9:
+                        send(f"🔒 TREND SL UPDATE - {name} (Daily)\n"
+                             f"Naya SL: {cur:.2f} (pehle {pos['sl']:.2f})\n"
+                             f"Broker me stop-loss isi price par badal do.\n"
+                             f"Entry (ref): {entry:.2f}")
+                        pos["sl"] = cur
+                        changed = True
+                continue
+            if n < max(TREND_N, 200) + 2 or np.isnan(a[i]):
+                continue
+            fresh = tr["last_sig"].get(name) != str(d.index[i]) and (today - d.index[i]).days <= 3
+            if fresh and c[i] > h[i - TREND_N:i].max() and c[i] > e200[i]:
+                risk = TREND_ATR * a[i]
+                stop0 = float(c[i] - risk)
+                tr["pos"][name] = {"entry": float(c[i]), "risk": float(risk), "stop0": stop0,
+                                   "sl": stop0, "ts": str(d.index[i])}
+                tr["last_sig"][name] = str(d.index[i])
+                send(f"📈 TREND BUY - {name} (Daily)\n"
+                     f"Signal candle close: {c[i]:.2f} ({d.index[i]:%d-%b})\n"
+                     f"SL: {stop0:.2f} ({risk / c[i] * 100:.1f}% niche, 2xATR)\n"
+                     f"TP: koi nahi. Trend chalne do, SL roz upar hoga (bot alert dega)\n"
+                     f"Exit: SL lagne par, ya bot ka EXIT message aane par\n"
+                     f"Backtest: {TREND_BT[name]}\n"
+                     f"Position size = account x 1% / (entry - SL)\n"
+                     f"Entry: kal ke open par ya abhi, live price dekhkar")
+                changed = True
+        except Exception as ex:
+            print(name, "trend error:", ex)
+    if changed:
+        json.dump(st, open(STATE_FILE, "w"))
+    print("trend check done", dt.datetime.utcnow())
+
+
 # ====================== RESEARCH: kam trade, bade timeframe ======================
 def donchian(df, N, M, side, cost, atr_mult=2.0, filt=200):
     """Breakout (pichhle N candle ka high/low todna) + EMA200 filter.
     SL = 2xATR, exit = pichhle M candle ka low/high (trailing). Entry agli candle ke open par.
-    Return: [(R cost ke baad, entry_time)]"""
+    Return: [(R cost ke baad, entry_time, exit_time)]"""
     o, h, l, c = df.open.values, df.high.values, df.low.values, df.close.values
     a = atr(df).values
     e200 = ema(df.close, filt).values
@@ -304,7 +393,7 @@ def donchian(df, N, M, side, cost, atr_mult=2.0, filt=200):
             j += 1
         if exit_p is None:
             exit_p, j = c[n - 1], n - 1
-        res.append(((exit_p - e) * d / risk - cost * e / risk, df.index[i + 1]))
+        res.append(((exit_p - e) * d / risk - cost * e / risk, df.index[i + 1], df.index[min(j, n - 1)]))
         i = j + 1
     return res
 
@@ -355,15 +444,12 @@ def run_research():
     print("\nNote: past result future ki guarantee nahi. OOS = last 30% data jo pehle nahi dekha.")
 
 
-if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "once"
-    if mode == "test":
-        send("⚡5M bot Telegram se connect ho gaya.")
-        print("test sent")
-    elif mode == "backtest":
-        run_backtest()
-    elif mode == "research":
-        run_research()
-    else:
-        run_once()
-          
+# ====================== INDIA: NSE stocks, sirf buy (delivery) ======================
+INDIA = ("RELIANCE TCS HDFCBANK INFY ICICIBANK HINDUNILVR ITC SBIN BHARTIARTL KOTAKBANK LT AXISBANK ASIANPAINT "
+         "MARUTI SUNPHARMA TITAN ULTRACEMCO BAJFINANCE NESTLEIND WIPRO HCLTECH NTPC POWERGRID ONGC TATASTEEL "
+         "JSWSTEEL TECHM ADANIENT ADANIPORTS COALINDIA GRASIM HINDALCO DRREDDY CIPLA BRITANNIA EICHERMOT "
+         "HEROMOTOCO BPCL INDUSINDBK DIVISLAB APOLLOHOSP TATACONSUM SBILIFE HDFCLIFE BAJAJFINSV PIDILITIND "
+         "DABUR GODREJCP HAVELLS SIEMENS AMBUJACEM BANKBARODA PNB DLF VEDL IOC GAIL TVSMOTOR MUTHOOTFIN "
+         "CHOLAFIN TRENT HAL BEL JINDALSTEL LUPIN AUROPHARMA COLPAL MARICO BERGEPAINT PAGEIND UPL BOSCHLTD "
+         "MRF ABB POLYCAB INDIGO IRCTC").split() + ["M&M", "BAJAJ-AUTO"]
+INDIA_COST = 0.0026     # round-trip: STT 0.2% + stamp 0.015% + baaki ~0.25% (
